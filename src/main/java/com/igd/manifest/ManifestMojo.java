@@ -1,15 +1,24 @@
 package com.igd.manifest;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Set;
 import java.util.jar.Attributes;
 import java.util.jar.Attributes.Name;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.jar.JarInputStream;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
 
@@ -79,52 +88,97 @@ public class ManifestMojo extends AbstractMojo {
 				}
 			}
 		}
-
-		try {
-			JarFile jarFile = new JarFile(new File(this.sourceDir , this.sourceJar));
-			
+		
+		try (JarFile jarFile = new JarFile(new File(this.sourceDir , this.sourceJar))) {
 			ByteArrayOutputStream newJarOut = new ByteArrayOutputStream();
 			JarOutputStream jos = new JarOutputStream(newJarOut);
+			String manifestMainClass = mainClass;
 			
+			//
+			Map<String, byte[]> resolveMap = new HashMap<>();
 			Enumeration<JarEntry> entries = jarFile.entries();
-			byte[] bytes = new byte[1024];
 			while (entries.hasMoreElements()) {
 				JarEntry jarEntry = entries.nextElement();
-				String vmainClass = null;
-				if(JarFile.MANIFEST_NAME.equals(jarEntry.getName())) {
-					Manifest manifest = jarFile.getManifest();
-					Attributes att = manifest.getMainAttributes();
-					if(map != null && map.size() > 0) {
-						map.entrySet().forEach((v) -> {
-							if(!Attributes.Name.MAIN_CLASS.toString().equals(v.getKey())) {
-								att.put(new Name(v.getKey()), v.getValue());
-							}
-						});
-						vmainClass = map.get(Attributes.Name.MAIN_CLASS.toString());
+				if(JarFile.MANIFEST_NAME.equals(jarEntry.getName())
+						|| jarEntry.isDirectory()) {
+					continue;
+				}
+				
+				BufferedInputStream in = new BufferedInputStream(jarFile.getInputStream(jarEntry));
+				byte[] barr = readJarEntryByteArray(in, true);
+				
+				jos.putNextEntry(new JarEntry(jarEntry.getName()));
+	            jos.write(barr);
+				
+	            if(jarEntry.getName().endsWith(".jar")) {
+	            	String prefixKey = jarEntry.getName() + "!/";
+	            	JarInputStream jis = new JarInputStream(new ByteArrayInputStream(barr));
+	            	JarEntry childJarEntry = null;
+					while((childJarEntry = jis.getNextJarEntry()) != null) {
+						barr = readJarEntryByteArray(jis ,false);
+						resolveMap.put(prefixKey + childJarEntry.getName(), barr);	
 					}
-					
-					if(mainClass == null || mainClass.length() == 0) {
-						mainClass = vmainClass;
-					}
-					
-					if(mainClass != null && mainClass.length() > 0) {
-						att.put(Attributes.Name.MAIN_CLASS, mainClass);	
-					}
-					ByteArrayOutputStream manifestOut = new ByteArrayOutputStream();
-					manifest.write(manifestOut);
-					jos.putNextEntry(new JarEntry(JarFile.MANIFEST_NAME));
-					jos.write(manifestOut.toByteArray());
-				} else {
-					jos.putNextEntry(new JarEntry(jarEntry.getName()));
-					BufferedInputStream in = new BufferedInputStream(jarFile.getInputStream(jarEntry));
-		            int len = in.read(bytes, 0, bytes.length);
-		            while(len != -1){
-		            	jos.write(bytes, 0, len);
-		                len = in.read(bytes, 0, bytes.length);
-		            }
-		            in.close();	
+					jis.close();
+	            } else {
+	            	resolveMap.put(jarEntry.getName(), barr);	
+	            }
+			}
+			
+			// 设置Manifest
+			Manifest manifest = jarFile.getManifest();
+			Attributes att = manifest.getMainAttributes();
+			Map<String, String> manifestMap = Optional.ofNullable(map).orElse(Collections.emptyMap());
+			if(manifestMainClass == null || manifestMainClass.length() == 0) {
+				manifestMainClass = manifestMap.remove(Attributes.Name.MAIN_CLASS.toString());
+			}
+			if(manifestMainClass != null && manifestMainClass.length() > 0) {
+				String oldMainClass = (String) att.put(Attributes.Name.MAIN_CLASS, manifestMainClass);	
+				if(oldMainClass != null && !oldMainClass.equals(mainClass)) {
+					att.put(new Name("Pre-Jar-Main-Class"), oldMainClass);
 				}
 			}
+			manifestMap.entrySet().forEach((v) -> {
+				att.put(new Name(v.getKey()), v.getValue());
+			});
+			ByteArrayOutputStream manifestOut = new ByteArrayOutputStream();
+			manifest.write(manifestOut);
+			jos.putNextEntry(new JarEntry(JarFile.MANIFEST_NAME));
+			jos.write(manifestOut.toByteArray());
+			
+			//
+			if(manifestMainClass != null && manifestMainClass.length() > 0) {
+				String mainclassStr = manifestMainClass.replaceAll("\\.", "/") + ".class";
+				if(resolveMap.containsKey(mainclassStr)) {
+					return;
+				}
+				
+				Set<Entry<String, byte[]>> set = resolveMap.entrySet();
+				
+				String fullPackagePrefix = null;
+				for(Entry<String, byte[]> entry : set) {
+					if(!entry.getKey().endsWith(mainclassStr)) {
+						continue;
+					}
+					String prefix = entry.getKey().substring(0, entry.getKey().lastIndexOf(mainclassStr));
+					if(entry.getKey().startsWith(prefix)) {
+						fullPackagePrefix = prefix;
+						break;
+					}
+				}
+				
+				if(fullPackagePrefix != null && !"".equals(fullPackagePrefix)) {
+					for(Entry<String, byte[]> entry : set) {
+						if(!entry.getKey().equals(fullPackagePrefix) && 
+								   entry.getKey().indexOf(fullPackagePrefix) == 0) {
+							String packageStr = entry.getKey().substring(entry.getKey().indexOf(fullPackagePrefix)+fullPackagePrefix.length());
+							jos.putNextEntry(new JarEntry(packageStr));
+							jos.write(entry.getValue());	
+						}
+					}	
+				} 
+			}
+			
+			
 			
 			File dest = new File(this.targetDir, this.targetJar);
 			FileOutputStream fous = new FileOutputStream(dest);
@@ -133,11 +187,27 @@ public class ManifestMojo extends AbstractMojo {
 			jos.close();
 			
 			fous.write(newJarOut.toByteArray());
-			
+			fous.flush();
 			fous.close();
-		} catch(Exception e) {
-			
+		} catch (Exception e) {
+			throw new MojoExecutionException("Mainifest gen fail", e);
 		}
 	}
-
+	
+	private byte[] readJarEntryByteArray(InputStream in , boolean isClose) throws IOException {
+		byte[] bytes = new byte[1024];
+		ByteArrayOutputStream dataOut = new ByteArrayOutputStream();
+        int len = in.read(bytes, 0, bytes.length);
+        while(len != -1){
+        	dataOut.write(bytes, 0, len);
+            len = in.read(bytes, 0, bytes.length);
+        }
+        byte[] barr = dataOut.toByteArray();
+        if(isClose) {
+        	in.close();		
+        }
+        dataOut.close();
+		return barr;
+	}
+	
 }
