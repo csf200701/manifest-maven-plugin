@@ -56,6 +56,9 @@ public class ManifestMojo extends AbstractMojo {
 	
 	@Parameter(property = "manifest.map", required = false)
 	private Map<String, String> map;
+	
+	
+	private String METAINF = "META-INF";
 
 	@Override
 	public void execute() throws MojoExecutionException, MojoFailureException {
@@ -99,17 +102,28 @@ public class ManifestMojo extends AbstractMojo {
 			Enumeration<JarEntry> entries = jarFile.entries();
 			while (entries.hasMoreElements()) {
 				JarEntry jarEntry = entries.nextElement();
-				if(JarFile.MANIFEST_NAME.equals(jarEntry.getName())
-						|| jarEntry.isDirectory()) {
+				if(jarEntry.getName().equals(JarFile.MANIFEST_NAME)) {
+					continue;
+				}
+				
+				JarEntry newJarEntry = new JarEntry(jarEntry.getName());
+				newJarEntry.setMethod(jarEntry.getMethod());
+            	newJarEntry.setSize(jarEntry.getSize());
+            	newJarEntry.setCrc(jarEntry.getCrc());
+            	newJarEntry.setLastModifiedTime(jarEntry.getLastModifiedTime());
+				
+				if(jarEntry.isDirectory()) {
+					jos.putNextEntry(new JarEntry(newJarEntry));
 					continue;
 				}
 				
 				BufferedInputStream in = new BufferedInputStream(jarFile.getInputStream(jarEntry));
 				byte[] barr = readJarEntryByteArray(in, true);
-				
-				jos.putNextEntry(new JarEntry(jarEntry.getName()));
+            	//newJarEntry.setCreationTime(jarEntry.getCreationTime());
+            	//newJarEntry.setLastAccessTime(jarEntry.getLastAccessTime());
+            	jos.putNextEntry(new JarEntry(newJarEntry));
 	            jos.write(barr);
-				
+	            
 	            if(jarEntry.getName().endsWith(".jar")) {
 	            	String prefixKey = jarEntry.getName() + "!/";
 	            	JarInputStream jis = new JarInputStream(new ByteArrayInputStream(barr));
@@ -171,6 +185,9 @@ public class ManifestMojo extends AbstractMojo {
 						if(!entry.getKey().equals(fullPackagePrefix) && 
 								   entry.getKey().indexOf(fullPackagePrefix) == 0) {
 							String packageStr = entry.getKey().substring(entry.getKey().indexOf(fullPackagePrefix)+fullPackagePrefix.length());
+							if(packageStr.startsWith(METAINF)) {
+								continue;
+							}
 							jos.putNextEntry(new JarEntry(packageStr));
 							jos.write(entry.getValue());	
 						}
@@ -190,6 +207,7 @@ public class ManifestMojo extends AbstractMojo {
 			fous.flush();
 			fous.close();
 		} catch (Exception e) {
+			e.printStackTrace();
 			throw new MojoExecutionException("Mainifest gen fail", e);
 		}
 	}
